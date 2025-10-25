@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Frame Captor — fixed</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/milligram/1.4.1/milligram.min.css">
+<style>
+  body { 
+    padding: 18px; 
+    max-width: 1100px; 
+    margin: auto; 
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  #preview-container {
+    position: relative;
+    width: 100%;
+    height: 360px;
+    background: #111;
+    border: 1px solid #ddd;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  #canvas {
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    display: block;
+  }
+  .controls { 
+    display: flex; 
+    gap: 8px; 
+    flex-wrap: wrap; 
+    margin: 8px 0; 
+    align-items: center;
+  }
+  .small { width: 80px; }
+  .info { 
+    margin-top: 8px; 
+    font-size: 0.9rem; 
+    color: #333; 
+  }
+  #video {
+    display: none;
+  }
+</style>
+</head>
+<body>
+<h3>Frame Captor — fixed</h3>
+<div class="controls">
+  <input id="file" type="file" accept="video/*" />
+  <button id="saveFrame" disabled>Save Frame (S)</button>
+  <button id="batch" disabled>Batch Extract</button>
+
+  <label style="display:flex;align-items:center;gap:6px;">
+    Interval frames
+    <input id="interval" class="small" type="number" min="1" value="30">
+  </label>
+
+  <label style="display:flex;align-items:center;gap:6px;">
+    Or every N seconds
+    <input id="everySec" class="small" type="number" min="0" step="0.1" value="0">
+  </label>
+
+  <button id="downloadZip" disabled>Download Zip</button>
+</div>
+
+<div id="preview-container">
+  <video id="video" crossorigin="anonymous"></video>
+  <canvas id="canvas"></canvas>
+</div>
+
+<input id="seek" type="range" min="0" max="1000" value="0" style="width:100%; margin-top:8px;" />
+<div class="controls" style="justify-content:space-between;">
+  <div>
+    <button id="prev">⟸ Prev</button>
+    <button id="play" disabled>Play ▶</button>
+    <button id="next">Next ⟹</button>
+  </div>
+  <div>
+    <span id="timeInfo">No video loaded</span>
+  </div>
+</div>
+
+<div class="info">
+  Tip: Use S to save the current frame. Batch extraction prepares a zip you can download.
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+(() => {
+  const fileInput = document.getElementById('file');
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const seek = document.getElementById('seek');
+  const playBtn = document.getElementById('play');
+  const prevBtn = document.getElementById('prev');
+  const nextBtn = document.getElementById('next');
+  const saveBtn = document.getElementById('saveFrame');
+  const batchBtn = document.getElementById('batch');
+  const intervalInput = document.getElementById('interval');
+  const everySecInput = document.getElementById('everySec');
+  const timeInfo = document.getElementById('timeInfo');
+  const downloadZipBtn = document.getElementById('downloadZip');
+
+  let playing = false;
+  let framesZip = null;
+  let savedFiles = [];
+  let filenameBase = 'video';
+  let videoObjectUrl = null;
+
+  // --- Utilities ---
+  function logInfo(s) { 
+    timeInfo.textContent = s; 
+  }
+
+  function triggerDownload(blob, name) {
+    const a = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+
+  function canvasToBlobAsync(canvasEl, type = 'image/png', quality = 1.0) {
+    return new Promise((res) => canvasEl.toBlob((b) => res(b), type, quality));
+  }
+
+  function sleep(ms) { 
+    return new Promise(r => setTimeout(r, ms)); 
+  }
+
+  function seekToAndDraw(t) {
+    return new Promise((resolve) => {
+      if (!video.duration) return resolve();
+      t = Math.min(Math.max(0, t), video.duration);
+      if (Math.abs(video.currentTime - t) < 0.0005) {
+        drawFrame();
+        return resolve();
+      }
+      const onSeeked = () => {
+        video.removeEventListener('seeked', onSeeked);
+        drawFrame();
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      };
+      video.addEventListener('seeked', onSeeked);
+      video.currentTime = t;
+    });
+  }
+
+  function drawFrame() {
+    if (!video.videoWidth || !video.videoHeight) return;
+
+    // Always draw at native resolution for quality
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0);
+
+    updateTimeInfo();
+  }
+
+  function updateTimeInfo() {
+    if (!video.duration || isNaN(video.duration)) {
+      timeInfo.textContent = 'No video loaded';
+      return;
+    }
+    timeInfo.textContent = `Time: ${video.currentTime.toFixed(3)}s / ${video.duration.toFixed(3)}s`;
+  }
+
+  function updateSeek() {
+    if (!video.duration || isNaN(video.duration)) {
+      seek.value = 0;
+      return;
+    }
+    seek.value = Math.round((video.currentTime / video.duration) * 1000);
+  }
+
+  // --- File loading ---
+  fileInput.addEventListener('change', (ev) => {
+    const f = ev.target.files?.[0];
+    if (!f) return;
+
+    if (videoObjectUrl) {
+      URL.revokeObjectURL(videoObjectUrl);
+      videoObjectUrl = null;
+    }
+
+    filenameBase = f.name.replace(/\.[^.]+$/, '');
+    videoObjectUrl = URL.createObjectURL(f);
+    video.src = videoObjectUrl;
+    video.load();
+
+    // Reset state
+    framesZip = new JSZip();
+    savedFiles = [];
+    downloadZipBtn.disabled = true;
+    saveBtn.disabled = true;
+    batchBtn.disabled = true;
+    playBtn.disabled = true;
+
+    video.addEventListener('loadedmetadata', () => {
+      // Initialize canvas with native size (for capture quality)
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 360;
+
+      seekToAndDraw(0).then(() => {
+        saveBtn.disabled = false;
+        batchBtn.disabled = false;
+        playBtn.disabled = false;
+        seek.max = 1000;
+        updateSeek();
+      });
+    }, { once: true });
+  });
+
+  // --- Controls ---
+  seek.addEventListener('input', () => {
+    if (!video.duration) return;
+    const t = (seek.value / 1000) * video.duration;
+    video.currentTime = t;
+  });
+
+  video.addEventListener('timeupdate', () => {
+    drawFrame();
+    updateSeek();
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (!video.src) return;
+    if (e.key === ' ') {
+      e.preventDefault();
+      togglePlay();
+    } else if (e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      saveCurrentFrame();
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      step(-1);
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      step(1);
+    }
+  });
+
+  prevBtn.addEventListener('click', () => step(-1));
+  nextBtn.addEventListener('click', () => step(1));
+  playBtn.addEventListener('click', togglePlay);
+  saveBtn.addEventListener('click', saveCurrentFrame);
+
+  function togglePlay() {
+    if (!video.src) return;
+    if (video.paused) {
+      video.play();
+      playBtn.textContent = 'Pause ⏸';
+    } else {
+      video.pause();
+      playBtn.textContent = 'Play ▶';
+    }
+  }
+
+  function step(dir) {
+    if (!video.duration) return;
+    const delta = 1 / 30;
+    const t = Math.min(Math.max(0, video.currentTime + dir * delta), video.duration);
+    seekToAndDraw(t);
+  }
+
+  async function saveCurrentFrame() {
+    if (!video.src) return;
+    await seekToAndDraw(video.currentTime);
+    const blob = await canvasToBlobAsync(canvas, 'image/png', 1.0);
+    const ts = video.currentTime.toFixed(3).replace('.', 'p');
+    const name = `${filenameBase}_t${ts}s.png`;
+
+    if (!framesZip) framesZip = new JSZip();
+    framesZip.file(name, blob);
+    savedFiles.push(name);
+    downloadZipBtn.disabled = false;
+    triggerDownload(blob, name);
+    logInfo(`Saved ${name}`);
+  }
+
+  batchBtn.addEventListener('click', async () => {
+    if (!video.src || !video.duration) return;
+    if (!video.paused) video.pause();
+    playBtn.textContent = 'Play ▶';
+
+    const intervalFrames = parseInt(intervalInput.value) || 0;
+    const everySec = parseFloat(everySecInput.value) || 0;
+    const assumedFps = 30;
+    const stepSec = everySec > 0 ? everySec : (intervalFrames > 0 ? intervalFrames / assumedFps : 1);
+
+    if (!framesZip) framesZip = new JSZip();
+    const names = [];
+    let count = 0;
+
+    for (let t = 0; t <= video.duration; t += stepSec) {
+      await seekToAndDraw(t);
+      await sleep(30);
+      const blob = await canvasToBlobAsync(canvas, 'image/png', 1.0);
+      const ts = t.toFixed(3).replace('.', 'p');
+      const name = `${filenameBase}_t${ts}s.png`;
+      framesZip.file(name, blob);
+      names.push(name);
+      count++;
+      logInfo(`Batch: saved ${count} frames... last ${name}`);
+    }
+
+    savedFiles = savedFiles.concat(names);
+    downloadZipBtn.disabled = false;
+    logInfo(`Batch complete: ${count} frames added to zip.`);
+  });
+
+  downloadZipBtn.addEventListener('click', async () => {
+    if (!framesZip) return;
+    logInfo('Generating ZIP...');
+    const blob = await framesZip.generateAsync({ type: 'blob' }, (meta) => {
+      logInfo(`Zipping ${Math.round(meta.percent)}%`);
+    });
+    triggerDownload(blob, `${filenameBase}_frames.zip`);
+    logInfo(`ZIP ready: ${filenameBase}_frames.zip`);
+  });
+
+})();
+</script>
+</body>
+</html>
